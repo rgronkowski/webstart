@@ -1,0 +1,192 @@
+stages:
+  - build
+  - test
+  - review
+  - deploy
+  - deploy-QA
+  - cleanup
+  - performance
+
+image: alpine
+
+
+variables:
+  CI_APPLICATION_REPOSITORY: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+  CI_APPLICATION_TAG: $CI_COMMIT_SHA
+ 
+build:
+  stage: build
+  image: docker:git
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  only:
+    refs:
+      - branches
+  script:
+    - echo "Building the app"
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker build -t ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG} -t ${CI_APPLICATION_REPOSITORY}:latest .
+    - docker push ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+    - docker push ${CI_APPLICATION_REPOSITORY}:latest
+
+
+container_scanning:
+  image: docker:stable
+  stage: test
+  variables:
+    DOCKER_DRIVER: overlay2
+    ## Define two new variables based on GitLab's CI/CD predefined variables
+    ## https://docs.gitlab.com/ee/ci/variables/#predefined-variables-environment-variables
+    #CI_APPLICATION_REPOSITORY: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+    #CI_APPLICATION_TAG: $CI_COMMIT_SHA
+  allow_failure: true
+  services:
+    - docker:stable-dind
+  only:
+    refs:
+      - branches
+  script:
+    - docker run -d --name db arminc/clair-db:latest
+    - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.1
+    - apk add -U wget ca-certificates
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker pull ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+    - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 clair-scanner
+    - chmod +x clair-scanner
+    - touch clair-whitelist.yml
+    - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+    - retries=0
+    - echo "Waiting for clair daemon to start"
+    - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+    - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r gl-container-scanning-report.json -l clair.log -w clair-whitelist.yml ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG} || true
+  artifacts:
+    paths: [gl-container-scanning-report.json]
+
+deploy_staging:
+  image: docker:stable
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  #when: manual
+  script:
+    - docker stop $CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja || true
+    - docker rm $CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja || true
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker run -d --network=gitlab_app_net --env VIRTUAL_HOST=$CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja --env LETSENCRYPT_HOST=$CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja --env LETSENCRYPT_EMAIL=ralf@gronkowski.de --name $CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+  environment:
+    name: staging
+    url: https://$CI_COMMIT_REF_SLUG.$CI_PROJECT_PATH_SLUG.gitlab.ninja
+  only:
+  - master
+  
+performance:
+  stage: performance
+  image: docker:stable
+  variables:
+    URL: https://$CI_COMMIT_REF_SLUG.$CI_PROJECT_PATH_SLUG.gitlab.ninja
+    GIT_STRATEGY: none
+  services:
+    - docker:stable-dind
+  only:
+    - master
+  script:
+    - mkdir gitlab-exporter
+    - wget -O ./gitlab-exporter/index.js https://gitlab.com/gitlab-org/gl-performance/raw/master/index.js
+    - mkdir sitespeed-results
+    - docker run --shm-size=1g --rm -v "$(pwd)":/sitespeed.io sitespeedio/sitespeed.io:6.3.1 --plugins.add ./gitlab-exporter --outputFolder sitespeed-results $URL
+    - mv sitespeed-results/data/performance.json performance.json
+  artifacts:
+    paths:
+    - performance.json
+    - sitespeed-results/
+
+deploy QA:
+  image: docker:stable
+  stage: deploy-QA
+  variables:
+    GIT_STRATEGY: none
+  only:
+    refs:
+      - tags
+    variables:
+      - $CI_COMMIT_TAG =~ /^(\d+\.)?(\d+\.)?(\*|\d+)-QA$/i
+  environment:
+    name: QA/$CI_COMMIT_TAG
+    url: https://$CI_COMMIT_TAG.QA.gitlab.ninja
+  script:
+    - echo tagging $CI_APPLICATION_TAG with $CI_COMMIT_TAG
+    - docker stop $CI_COMMIT_TAG.QA.gitlab.ninja || true
+    - docker rm $CI_COMMIT_TAG.QA.gitlab.ninja || true
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker pull $CI_REGISTRY_IMAGE/master:latest
+    - docker tag $CI_REGISTRY_IMAGE/master:latest $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+    - docker run -d --network=gitlab_app_net --env VIRTUAL_HOST=$CI_COMMIT_TAG.QA.gitlab.ninja --env LETSENCRYPT_HOST=$CI_COMMIT_REF_NAME.$CI_PROJECT_PATH_SLUG.gitlab.ninja --env LETSENCRYPT_EMAIL=ralf@gronkowski.de --env LETSENCRYPT_TEST=true --name $CI_COMMIT_TAG.QA.gitlab.ninja $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+
+stop_QA:
+  stage: cleanup
+  image: docker:stable
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "stop QA"
+    - docker stop $CI_COMMIT_TAG.QA.gitlab.ninja || true
+    - docker rm $CI_COMMIT_TAG.QA.gitlab.ninja || true
+  environment:
+    name: QA/$CI_COMMIT_TAG
+    action: stop
+  when: manual
+  allow_failure: true
+  only:
+    refs:
+      - tags
+    variables:
+      - $CI_COMMIT_TAG =~ /^(\d+\.)?(\d+\.)?(\*|\d+)-QA$/i
+
+
+
+review:
+  stage: review
+  image: docker:stable
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "review"
+    - docker stop $CI_COMMIT_REF_NAME.gitlab.ninja || true
+    - docker rm $CI_COMMIT_REF_NAME.gitlab.ninja || true
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker run -d --network=gitlab_app_net --env VIRTUAL_HOST=$CI_COMMIT_REF_NAME.gitlab.ninja --name $CI_COMMIT_REF_NAME.gitlab.ninja ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: http://$CI_COMMIT_REF_NAME.gitlab.ninja
+    on_stop: stop_review
+  artifacts:
+    paths: [environment_url.txt]
+  only:
+    refs:
+      - branches
+  except:
+    - master
+
+stop_review:
+  stage: cleanup
+  image: docker:stable
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "stop review"
+    - docker stop $CI_COMMIT_REF_NAME.gitlab.ninja || true
+    - docker rm $CI_COMMIT_REF_NAME.gitlab.ninja || true
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  when: manual
+  allow_failure: true
+  only:
+    refs:
+      - branches
+  except:
+    - master
